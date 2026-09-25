@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+import fcntl
+import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
-from typing import Sequence
+import tempfile
+from typing import Iterator, Sequence
 
-from .config import ConfigError, default_config_path, load_config, source_problem
+from .config import ConfigError, _load_json, _root_path, default_config_path, load_config, source_problem
 from .models import DiffRow, Plan, SkillSet, State
 from .planner import inspect_recorded, plan_remove, plan_set
 from .storage import (
@@ -49,6 +54,33 @@ def _parser() -> argparse.ArgumentParser:
     remove.add_argument("--dry-run", action="store_true")
     remove.add_argument("--project-root", metavar="DIR")
     remove.add_argument("--config", metavar="FILE")
+
+    sync = commands.add_parser("sync", help="synchronize projects under registered roots")
+    sync.add_argument("--project-root", metavar="DIR")
+    sync.add_argument("--dry-run", action="store_true")
+    sync.add_argument("--config", metavar="FILE")
+
+    watch = commands.add_parser("watch", help="watch registered roots and synchronize projects")
+    watch.add_argument("--config", metavar="FILE")
+
+    service = commands.add_parser("service", help="manage the user-level skillset watch service")
+    service.add_argument("action", choices=("install", "start", "stop", "status", "uninstall"))
+    service.add_argument("--config", metavar="FILE")
+
+    roots = commands.add_parser("roots", help="manage automatic synchronization roots")
+    root_commands = roots.add_subparsers(dest="roots_command", required=True)
+    root_add = root_commands.add_parser("add", help="register a root with a skill set")
+    root_add.add_argument("directory", metavar="DIR")
+    root_add.add_argument("--set", dest="set_name", metavar="NAME", required=True)
+    root_add.add_argument("--config", metavar="FILE")
+    root_disable = root_commands.add_parser("disable", help="disable automatic sync under a root")
+    root_disable.add_argument("directory", metavar="DIR")
+    root_disable.add_argument("--config", metavar="FILE")
+    root_remove = root_commands.add_parser("remove", help="remove a root rule")
+    root_remove.add_argument("directory", metavar="DIR")
+    root_remove.add_argument("--config", metavar="FILE")
+    root_list = root_commands.add_parser("list", help="list configured root rules")
+    root_list.add_argument("--config", metavar="FILE")
     return parser
 
 
@@ -144,6 +176,134 @@ def _has_label(plan: Plan, label: str) -> bool:
 
 def _configuration_path(argument: str | None) -> Path:
     return Path(argument).expanduser() if argument is not None else default_config_path()
+
+
+def _root_argument(directory: str, *, must_exist: bool) -> Path:
+    try:
+        root = Path(directory).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"cannot normalize root path {directory!r}: {exc}") from None
+    if root == Path("/"):
+        raise ConfigError("filesystem root cannot be registered")
+    if must_exist:
+        try:
+            info = root.lstat()
+        except OSError as exc:
+            raise ConfigError(f"root directory does not exist: {root}") from None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ConfigError(f"root path must resolve to an ordinary directory: {root}")
+    return root
+
+
+@contextmanager
+def _config_lock(path: Path) -> Iterator[None]:
+    lock_path = path.with_name(f".{path.name}.skillset.lock")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno == getattr(os, "ELOOP", 40):
+            raise UnsafePathError(f"unsafe configuration lock: {lock_path}") from None
+        raise
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise UnsafePathError(f"unsafe configuration lock: expected an ordinary file at {lock_path}")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LockBusyError(f"another skillset root update holds {lock_path}") from None
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _write_config_atomic(path: Path, value: object) -> None:
+    try:
+        existing = path.lstat()
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect configuration {path}: {exc}") from None
+    if stat.S_ISLNK(existing.st_mode) or not stat.S_ISREG(existing.st_mode):
+        raise ConfigError(f"configuration must be an ordinary file: {path}")
+    mode = stat.S_IMODE(existing.st_mode)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _roots_command(args: argparse.Namespace) -> int:
+    config_path = _configuration_path(args.config)
+    config = load_config(config_path)
+    if args.roots_command == "list":
+        for root, set_name in sorted(config.roots.items(), key=lambda item: str(item[0])):
+            print(f"{root}\t{set_name if set_name is not None else 'disabled'}")
+        return 0
+
+    must_exist = args.roots_command in ("add", "disable")
+    root = _root_argument(args.directory, must_exist=must_exist)
+    if args.roots_command == "add" and args.set_name not in config.sets:
+        raise ConfigError(f"unknown set: {args.set_name}")
+
+    try:
+        config_path = config_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ConfigError(f"cannot resolve configuration path: {exc}") from None
+    with _config_lock(config_path):
+        current_config = load_config(config_path)
+        if args.roots_command == "add" and args.set_name not in current_config.sets:
+            raise ConfigError(f"unknown set: {args.set_name}")
+        raw = _load_json(config_path)
+        if not isinstance(raw, dict):
+            raise ConfigError("configuration must be an object")
+        roots = raw.get("roots", {})
+        if not isinstance(roots, dict):
+            raise ConfigError("roots must be an object")
+        key = str(root)
+        matching_keys = [raw_key for raw_key in roots if _root_path(raw_key) == root]
+        existing_key = matching_keys[0] if matching_keys else None
+        if args.roots_command == "add":
+            value: str | None = args.set_name
+        elif args.roots_command == "disable":
+            value = None
+        elif args.roots_command == "remove":
+            value = None
+        else:
+            raise ConfigError(f"unknown roots command: {args.roots_command}")
+
+        if args.roots_command == "remove":
+            changed = existing_key is not None
+            if changed:
+                del roots[existing_key]
+        else:
+            target_key = existing_key if existing_key is not None else key
+            changed = target_key not in roots or roots[target_key] != value
+            roots[target_key] = value
+        if changed:
+            raw["roots"] = roots
+            _write_config_atomic(config_path, raw)
+
+    if args.roots_command == "add":
+        print(f"registered\t{root}\t{args.set_name}")
+    elif args.roots_command == "disable":
+        print(f"disabled\t{root}")
+    return 0
 
 
 def _path_exists_including_symlink(path: Path) -> bool:
@@ -356,6 +516,25 @@ def _remove(args: argparse.Namespace, root: Path, snapshot: Snapshot) -> int:
 
 
 def _dispatch(args: argparse.Namespace) -> int:
+    if args.command == "roots":
+        return _roots_command(args)
+    if args.command == "sync":
+        from .auto import sync_projects
+
+        return sync_projects(
+            _configuration_path(args.config),
+            Path(args.project_root).expanduser() if args.project_root is not None else None,
+            dry_run=args.dry_run,
+        )
+    if args.command == "watch":
+        from .watch import run_watch
+
+        return run_watch(_configuration_path(args.config))
+    if args.command == "service":
+        from .service import manage_service
+
+        return manage_service(args.action, _configuration_path(args.config))
+
     root = _project_root(args.project_root)
     snapshot = load_snapshot(root)
     if snapshot.journal is not None:

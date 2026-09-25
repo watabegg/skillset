@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from skillset.config import ConfigError, load_config, source_problem, validate_selected_sources
+from skillset.models import Config
 
 
 def write_skill(path: Path, content: str = "# skill\n") -> Path:
@@ -47,6 +48,48 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.sets["team"].agents, ("codex", "claude"))
         self.assertEqual(config.sets["team"].skills["alpha-skill"], source.resolve())
         self.assertEqual(config.sets["empty"].skills, {})
+
+    def test_optional_roots_normalize_symlinks_and_allow_missing_directories(self) -> None:
+        source = write_skill(self.root / "source")
+        projects = self.root / "projects"
+        projects.mkdir()
+        alias = self.root / "projects-alias"
+        alias.symlink_to(projects, target_is_directory=True)
+        missing = self.root / "will-appear-later"
+        self.write_config(
+            {
+                "schema_version": 1,
+                "sets": {"team": {"agents": ["codex"], "skills": {"skill": str(source)}}},
+                "roots": {str(alias): "team", str(missing): None},
+            }
+        )
+
+        config = load_config(self.config_path)
+        self.assertEqual(config.roots, {projects.resolve(): "team", missing.resolve(): None})
+        self.assertEqual(Config(sets={}).roots, {})
+
+    def test_root_rules_reject_duplicates_files_root_and_unknown_sets(self) -> None:
+        project = self.root / "project"
+        project.mkdir()
+        alias = self.root / "alias"
+        alias.symlink_to(project, target_is_directory=True)
+        base = {"schema_version": 1, "sets": {"team": {"agents": ["codex"], "skills": {}}}}
+        invalid_values = [
+            {**base, "roots": {str(project): "team", str(alias): None}},
+            {**base, "roots": {"/": "team"}},
+            {**base, "roots": {str(project): "missing"}},
+            {**base, "roots": {str(project): 1}},
+            {**base, "roots": [str(project)]},
+            {**base, "unexpected": True},
+        ]
+        file_path = self.root / "not-a-directory"
+        file_path.write_text("x", encoding="utf-8")
+        invalid_values.append({**base, "roots": {str(file_path): "team"}})
+        for value in invalid_values:
+            with self.subTest(value=value):
+                self.write_config(value)
+                with self.assertRaises(ConfigError):
+                    load_config(self.config_path)
 
     def test_validates_all_set_shapes_but_not_unselected_source_availability(self) -> None:
         self.write_config(

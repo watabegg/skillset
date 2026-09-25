@@ -53,6 +53,7 @@ class SkillSet:
 @dataclass(frozen=True)
 class Config:
     sets: dict[str, SkillSet]
+    roots: dict[Path, str | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

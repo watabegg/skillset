@@ -67,12 +67,44 @@ def _source_path(value: object, *, set_name: str, skill: str) -> Path:
         raise ConfigError(f"set {set_name!r} skill {skill!r}: cannot normalize source: {exc}") from None
 
 
+def _root_path(value: object) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ConfigError("root paths must be nonempty absolute paths or start with '~/'.")
+    if value.startswith("~/"):
+        path = Path(os.path.expanduser(value))
+    elif value.startswith("~"):
+        raise ConfigError("root paths may only expand the ~/ prefix")
+    else:
+        path = Path(value)
+        if not path.is_absolute():
+            raise ConfigError(f"root path must be absolute or start with '~/': {value!r}")
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"cannot normalize root path {value!r}: {exc}") from None
+    if resolved == Path("/"):
+        raise ConfigError("filesystem root cannot be a configured root")
+    try:
+        info = resolved.stat()
+    except FileNotFoundError:
+        return resolved
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"cannot inspect root path {resolved}: {exc}") from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise ConfigError(f"configured root is not a directory: {resolved}")
+    return resolved
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     """Read configuration and validate every set's schema, without stat'ing sources."""
     config_path = Path(path).expanduser() if path is not None else default_config_path()
     value = _load_json(config_path)
-    if not isinstance(value, dict) or set(value) != {"schema_version", "sets"}:
-        raise ConfigError("configuration must contain schema_version and sets only")
+    if not isinstance(value, dict) or not {"schema_version", "sets"}.issubset(value) or set(value) - {
+        "schema_version",
+        "sets",
+        "roots",
+    }:
+        raise ConfigError("configuration must contain schema_version and sets, with optional roots only")
     version = value["schema_version"]
     if isinstance(version, bool) or not isinstance(version, int) or version != 1:
         raise ConfigError("unsupported schema_version (expected integer 1)")
@@ -107,7 +139,18 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
                 raise ConfigError(f"set {name!r}: invalid skill name {skill!r}")
             skills[skill] = _source_path(source, set_name=name, skill=skill)
         sets[name] = SkillSet(name=name, agents=tuple(agents), skills=skills)
-    return Config(sets=sets)
+    raw_roots = value.get("roots", {})
+    if not isinstance(raw_roots, dict):
+        raise ConfigError("roots must be an object")
+    roots: dict[Path, str | None] = {}
+    for raw_path, set_name in raw_roots.items():
+        root = _root_path(raw_path)
+        if root in roots:
+            raise ConfigError(f"duplicate normalized root path: {root}")
+        if set_name is not None and (not isinstance(set_name, str) or set_name not in sets):
+            raise ConfigError(f"root {root} must map to an existing set name or null")
+        roots[root] = set_name
+    return Config(sets=sets, roots=roots)
 
 
 def source_problem(skill: str, source: Path) -> SourceProblem | None:
