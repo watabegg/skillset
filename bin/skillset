@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Repository-local launcher that works through symlinks and foreign cwd."""
+
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from skillset.cli import main  # noqa: E402
+
+raise SystemExit(main())
+

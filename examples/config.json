@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "sets": {
+    "client-a": {
+      "agents": [
+        "codex",
+        "claude"
+      ],
+      "skills": {
+        "client-a-artifacts": "~/client-a/agent-skills/skills/client-a-artifacts",
+        "gh-pr-ci-followup": "~/client-a/agent-skills/skills/gh-pr-ci-followup"
+      }
+    }
+  }
+}
